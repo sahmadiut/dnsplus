@@ -9,6 +9,11 @@
 //
 //	dnstt-server gen-key --privkey-file server.key --pubkey-file server.pub
 //	dnstt-server run --udp :53 --privkey-file server.key 127.0.0.1:8000
+//
+// The legacy single-flag syntax is also supported for backward compatibility:
+//
+//	dnstt-server -gen-key [-privkey-file FILE] [-pubkey-file FILE]
+//	dnstt-server -udp ADDR [-privkey-file FILE | -privkey HEX] [-mtu N] UPSTREAMADDR
 package main
 
 import (
@@ -16,12 +21,14 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -817,8 +824,82 @@ func run(privkey []byte, upstream string, dnsConn net.PacketConn) error {
 	return recvLoop(dnsConn, ttConn, ch)
 }
 
+// legacyTranslateServerArgs detects the old single-flag invocation style
+// (e.g. -gen-key -privkey-file FILE or -udp ADDR -privkey-file FILE UPSTREAMADDR)
+// and translates it to the new subcommand style
+// (e.g. gen-key --privkey-file FILE or run --udp ADDR --privkey-file FILE UPSTREAMADDR).
+// Returns nil when no translation is needed (args already use subcommand style).
+func legacyTranslateServerArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	// New-style subcommand syntax or built-in cobra commands – no translation.
+	switch args[0] {
+	case "gen-key", "run", "help", "completion", "--help", "-h":
+		return nil
+	}
+	// Old-style args always start with a dash (e.g. -gen-key, -udp).
+	if !strings.HasPrefix(args[0], "-") {
+		return nil
+	}
+
+	// Parse old-style flags.
+	fs := flag.NewFlagSet("legacy", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var genKey bool
+	var udpAddr, privkeyFile, privkeyHex, pubkeyFile string
+	var mtu int
+	fs.BoolVar(&genKey, "gen-key", false, "")
+	fs.StringVar(&udpAddr, "udp", "", "")
+	fs.StringVar(&privkeyFile, "privkey-file", "", "")
+	fs.StringVar(&privkeyHex, "privkey", "", "")
+	fs.StringVar(&pubkeyFile, "pubkey-file", "", "")
+	fs.IntVar(&mtu, "mtu", 0, "")
+	if err := fs.Parse(args); err != nil {
+		return nil
+	}
+
+	var newArgs []string
+	if genKey {
+		newArgs = []string{"gen-key"}
+		if privkeyFile != "" {
+			newArgs = append(newArgs, "--privkey-file", privkeyFile)
+		}
+		if pubkeyFile != "" {
+			newArgs = append(newArgs, "--pubkey-file", pubkeyFile)
+		}
+	} else {
+		positional := fs.Args() // [UPSTREAMADDR]
+		if len(positional) == 0 {
+			return nil
+		}
+		newArgs = []string{"run", positional[0]}
+		if udpAddr != "" {
+			newArgs = append(newArgs, "--udp", udpAddr)
+		}
+		if privkeyFile != "" {
+			newArgs = append(newArgs, "--privkey-file", privkeyFile)
+		}
+		if privkeyHex != "" {
+			newArgs = append(newArgs, "--privkey", privkeyHex)
+		}
+		if mtu != 0 {
+			newArgs = append(newArgs, "--mtu", fmt.Sprintf("%d", mtu))
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "warning: legacy flag syntax is deprecated; use: dnstt-server %s\n",
+		strings.Join(newArgs, " "))
+	return newArgs
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
+
+	// Translate old single-flag syntax to new subcommand syntax for backward compatibility.
+	if translated := legacyTranslateServerArgs(os.Args[1:]); translated != nil {
+		os.Args = append([]string{os.Args[0]}, translated...)
+	}
 
 	rootCmd := &cobra.Command{
 		Use:   "dnstt-server",

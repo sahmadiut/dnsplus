@@ -11,12 +11,19 @@
 //	dnstt-client doh --pubkey-file server.pub t.example.com 127.0.0.1:7000 https://resolver.example/dns-query
 //	dnstt-client dot --pubkey-file server.pub t.example.com 127.0.0.1:7000 resolver.example:853
 //	dnstt-client udp --pubkey-file server.pub t.example.com 127.0.0.1:7000 resolver.example:53
+//
+// The legacy single-flag syntax is also supported for backward compatibility:
+//
+//	dnstt-client -doh URL [-pubkey-file FILE|-pubkey HEX] [-utls SPEC] DOMAIN LOCALADDR
+//	dnstt-client -dot ADDR [-pubkey-file FILE|-pubkey HEX] [-utls SPEC] DOMAIN LOCALADDR
+//	dnstt-client -udp ADDR [-pubkey-file FILE|-pubkey HEX] DOMAIN LOCALADDR
 package main
 
 import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -265,8 +272,81 @@ func parseCommonArgs(args []string) (dns.Name, *net.TCPAddr, error) {
 	return domain, localAddr, nil
 }
 
+// legacyTranslateClientArgs detects the old single-flag invocation style
+// (e.g. -doh URL -pubkey-file FILE DOMAIN LOCALADDR) and translates it to
+// the new subcommand style (e.g. doh --pubkey-file FILE DOMAIN LOCALADDR URL).
+// Returns nil when no translation is needed (args already use subcommand style).
+func legacyTranslateClientArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	// New-style subcommand syntax or built-in cobra commands – no translation.
+	switch args[0] {
+	case "doh", "dot", "udp", "help", "completion", "--help", "-h":
+		return nil
+	}
+	// Old-style args always start with a dash (e.g. -doh, -dot, -udp).
+	if !strings.HasPrefix(args[0], "-") {
+		return nil
+	}
+
+	// Parse old-style flags.
+	fs := flag.NewFlagSet("legacy", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var dohURL, dotAddr, udpAddr string
+	var pubkeyFile, pubkeyHex, utlsSpec string
+	fs.StringVar(&dohURL, "doh", "", "")
+	fs.StringVar(&dotAddr, "dot", "", "")
+	fs.StringVar(&udpAddr, "udp", "", "")
+	fs.StringVar(&pubkeyFile, "pubkey-file", "", "")
+	fs.StringVar(&pubkeyHex, "pubkey", "", "")
+	fs.StringVar(&utlsSpec, "utls", "", "")
+	if err := fs.Parse(args); err != nil {
+		return nil
+	}
+
+	// Determine transport subcommand and resolver value.
+	var subcmd, resolver string
+	switch {
+	case dohURL != "":
+		subcmd, resolver = "doh", dohURL
+	case dotAddr != "":
+		subcmd, resolver = "dot", dotAddr
+	case udpAddr != "":
+		subcmd, resolver = "udp", udpAddr
+	default:
+		return nil
+	}
+
+	// Positional args after flag parsing are [DOMAIN, LOCALADDR].
+	positional := fs.Args()
+
+	// Build new-style args: SUBCOMMAND [DOMAIN LOCALADDR] RESOLVER [--flags...]
+	newArgs := []string{subcmd}
+	newArgs = append(newArgs, positional...) // DOMAIN, LOCALADDR
+	newArgs = append(newArgs, resolver)
+	if pubkeyFile != "" {
+		newArgs = append(newArgs, "--pubkey-file", pubkeyFile)
+	}
+	if pubkeyHex != "" {
+		newArgs = append(newArgs, "--pubkey", pubkeyHex)
+	}
+	if utlsSpec != "" {
+		newArgs = append(newArgs, "--utls", utlsSpec)
+	}
+
+	fmt.Fprintf(os.Stderr, "warning: legacy flag syntax is deprecated; use: dnstt-client %s\n",
+		strings.Join(newArgs, " "))
+	return newArgs
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
+
+	// Translate old single-flag syntax to new subcommand syntax for backward compatibility.
+	if translated := legacyTranslateClientArgs(os.Args[1:]); translated != nil {
+		os.Args = append([]string{os.Args[0]}, translated...)
+	}
 
 	const defaultUTLS = "4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13"
 
