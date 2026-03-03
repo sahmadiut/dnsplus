@@ -2,47 +2,21 @@
 //
 // Usage:
 //
-//	dnstt-client [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE DOMAIN LOCALADDR
+//	dnstt-client doh  [--pubkey-file FILE | --pubkey HEX] [--utls SPEC] DOMAIN LOCALADDR RESOLVER_URL
+//	dnstt-client dot  [--pubkey-file FILE | --pubkey HEX] [--utls SPEC] DOMAIN LOCALADDR RESOLVER_ADDR
+//	dnstt-client udp  [--pubkey-file FILE | --pubkey HEX] DOMAIN LOCALADDR RESOLVER_ADDR
 //
 // Examples:
 //
-//	dnstt-client -doh https://resolver.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
-//	dnstt-client -dot resolver.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
-//
-// The program supports DNS over HTTPS (DoH), DNS over TLS (DoT), and UDP DNS.
-// Use one of these options:
-//
-//	-doh https://resolver.example/dns-query
-//	-dot resolver.example:853
-//	-udp resolver.example:53
-//
-// You can give the server's public key as a file or as a hex string. Use
-// "dnstt-server -gen-key" to get the public key.
-//
-//	-pubkey-file server.pub
-//	-pubkey 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
-//
-// DOMAIN is the root of the DNS zone reserved for the tunnel. See README for
-// instructions on setting it up.
-//
-// LOCALADDR is the TCP address that will listen for connections and forward
-// them over the tunnel.
-//
-// In -doh and -dot modes, the program's TLS fingerprint is camouflaged with
-// uTLS by default. The specific TLS fingerprint is selected randomly from a
-// weighted distribution. You can set your own distribution (or specific single
-// fingerprint) using the -utls option. The special value "none" disables uTLS.
-//
-//	-utls '3*Firefox,2*Chrome,1*iOS'
-//	-utls Firefox
-//	-utls none
+//	dnstt-client doh --pubkey-file server.pub t.example.com 127.0.0.1:7000 https://resolver.example/dns-query
+//	dnstt-client dot --pubkey-file server.pub t.example.com 127.0.0.1:7000 resolver.example:853
+//	dnstt-client udp --pubkey-file server.pub t.example.com 127.0.0.1:7000 resolver.example:53
 package main
 
 import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -53,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/spf13/cobra"
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
@@ -237,136 +212,179 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 }
 
-func main() {
-	var dohURL string
-	var dotAddr string
-	var pubkeyFilename string
-	var pubkeyString string
-	var udpAddr string
-	var utlsDistribution string
-
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s [-doh URL|-dot ADDR|-udp ADDR] -pubkey-file PUBKEYFILE DOMAIN LOCALADDR
-
-Examples:
-  %[1]s -doh https://resolver.example/dns-query -pubkey-file server.pub t.example.com 127.0.0.1:7000
-  %[1]s -dot resolver.example:853 -pubkey-file server.pub t.example.com 127.0.0.1:7000
-
-`, os.Args[0])
-		flag.PrintDefaults()
-		labels := make([]string, 0, len(utlsClientHelloIDMap))
-		labels = append(labels, "none")
-		for _, entry := range utlsClientHelloIDMap {
-			labels = append(labels, entry.Label)
-		}
-		fmt.Fprintf(flag.CommandLine.Output(), `
-Known TLS fingerprints for -utls are:
-`)
-		i := 0
-		for i < len(labels) {
-			var line strings.Builder
-			fmt.Fprintf(&line, "  %s", labels[i])
-			w := 2 + len(labels[i])
-			i++
-			for i < len(labels) && w+1+len(labels[i]) <= 72 {
-				fmt.Fprintf(&line, " %s", labels[i])
-				w += 1 + len(labels[i])
-				i++
-			}
-			fmt.Fprintln(flag.CommandLine.Output(), line.String())
-		}
+// utlsFingerprints returns a formatted list of known TLS fingerprint names.
+func utlsFingerprints() string {
+	labels := make([]string, 0, len(utlsClientHelloIDMap)+1)
+	labels = append(labels, "none")
+	for _, entry := range utlsClientHelloIDMap {
+		labels = append(labels, entry.Label)
 	}
-	flag.StringVar(&dohURL, "doh", "", "URL of DoH resolver")
-	flag.StringVar(&dotAddr, "dot", "", "address of DoT resolver")
-	flag.StringVar(&pubkeyString, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
-	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "read server public key from file")
-	flag.StringVar(&udpAddr, "udp", "", "address of UDP DNS resolver")
-	flag.StringVar(&utlsDistribution, "utls",
-		"4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13",
-		"choose TLS fingerprint from weighted distribution")
-	flag.Parse()
+	var sb strings.Builder
+	i := 0
+	for i < len(labels) {
+		fmt.Fprintf(&sb, "  %s", labels[i])
+		w := 2 + len(labels[i])
+		i++
+		for i < len(labels) && w+1+len(labels[i]) <= 72 {
+			fmt.Fprintf(&sb, " %s", labels[i])
+			w += 1 + len(labels[i])
+			i++
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
 
+// parsePubkey resolves a public key from --pubkey-file or --pubkey flags.
+func parsePubkey(pubkeyFilename, pubkeyString string) ([]byte, error) {
+	if pubkeyFilename != "" && pubkeyString != "" {
+		return nil, fmt.Errorf("only one of --pubkey and --pubkey-file may be used")
+	}
+	if pubkeyFilename != "" {
+		return readKeyFromFile(pubkeyFilename)
+	}
+	if pubkeyString != "" {
+		return noise.DecodeKey(pubkeyString)
+	}
+	return nil, fmt.Errorf("one of --pubkey or --pubkey-file is required")
+}
+
+// parseCommonArgs validates and parses DOMAIN and LOCALADDR positional arguments.
+func parseCommonArgs(args []string) (dns.Name, *net.TCPAddr, error) {
+	if len(args) < 2 {
+		return nil, nil, fmt.Errorf("DOMAIN and LOCALADDR arguments are required")
+	}
+	domain, err := dns.ParseName(args[0])
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid domain %+q: %v", args[0], err)
+	}
+	localAddr, err := net.ResolveTCPAddr("tcp", args[1])
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid local address %+q: %v", args[1], err)
+	}
+	return domain, localAddr, nil
+}
+
+func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
-	if flag.NArg() != 2 {
-		flag.Usage()
-		os.Exit(1)
-	}
-	domain, err := dns.ParseName(flag.Arg(0))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", flag.Arg(0), err)
-		os.Exit(1)
-	}
-	localAddr, err := net.ResolveTCPAddr("tcp", flag.Arg(1))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	const defaultUTLS = "4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13"
+
+	rootCmd := &cobra.Command{
+		Use:   "dnstt-client",
+		Short: "DNS tunnel client",
+		Long: `dnstt-client tunnels TCP connections through DNS queries.
+
+Choose a transport subcommand (doh, dot, or udp) to connect to a DNS resolver.
+The tunnel forwards local TCP connections to the remote upstream server via DNS.`,
 	}
 
-	var pubkey []byte
-	if pubkeyFilename != "" && pubkeyString != "" {
-		fmt.Fprintf(os.Stderr, "only one of -pubkey and -pubkey-file may be used\n")
-		os.Exit(1)
-	} else if pubkeyFilename != "" {
-		var err error
-		pubkey, err = readKeyFromFile(pubkeyFilename)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot read pubkey from file: %v\n", err)
-			os.Exit(1)
-		}
-	} else if pubkeyString != "" {
-		var err error
-		pubkey, err = noise.DecodeKey(pubkeyString)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "pubkey format error: %v\n", err)
-			os.Exit(1)
-		}
-	}
-	if len(pubkey) == 0 {
-		fmt.Fprintf(os.Stderr, "the -pubkey or -pubkey-file option is required\n")
-		os.Exit(1)
+	// Shared flags across transport subcommands.
+	var pubkeyFile string
+	var pubkeyHex string
+
+	addPubkeyFlags := func(cmd *cobra.Command) {
+		cmd.Flags().StringVar(&pubkeyFile, "pubkey-file", "", "path to server public key file")
+		cmd.Flags().StringVar(&pubkeyHex, "pubkey", "", fmt.Sprintf("server public key as hex (%d digits)", noise.KeyLen*2))
 	}
 
-	utlsClientHelloID, err := sampleUTLSDistribution(utlsDistribution)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "parsing -utls: %v\n", err)
-		os.Exit(1)
-	}
-	if utlsClientHelloID != nil {
-		log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
-	}
+	// ── doh subcommand ────────────────────────────────────────────────────
+	var utlsDoh string
+	dohCmd := &cobra.Command{
+		Use:   "doh DOMAIN LOCALADDR RESOLVER_URL",
+		Short: "Use DNS-over-HTTPS (DoH) as transport",
+		Long: `Connect to the tunnel server using DNS-over-HTTPS (DoH).
 
-	// Iterate over the remote resolver address options and select one and
-	// only one.
-	var remoteAddr net.Addr
-	var pconn net.PacketConn
-	for _, opt := range []struct {
-		s string
-		f func(string) (net.Addr, net.PacketConn, error)
-	}{
-		// -doh
-		{dohURL, func(s string) (net.Addr, net.PacketConn, error) {
-			addr := turbotunnel.DummyAddr{}
+DOMAIN      – root DNS zone delegated to the tunnel server (e.g. t.example.com)
+LOCALADDR   – local TCP address to listen on (e.g. 127.0.0.1:7000)
+RESOLVER_URL – HTTPS URL of the DoH resolver (e.g. https://dns.example/dns-query)
+
+TLS fingerprint camouflage is enabled by default via uTLS.
+Use --utls to select a specific fingerprint or distribution.
+
+Known fingerprints for --utls:
+` + utlsFingerprints(),
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			domain, localAddr, err := parseCommonArgs(args[:2])
+			if err != nil {
+				return err
+			}
+			dohURL := args[2]
+
+			pubkey, err := parsePubkey(pubkeyFile, pubkeyHex)
+			if err != nil {
+				return err
+			}
+
+			utlsClientHelloID, err := sampleUTLSDistribution(utlsDoh)
+			if err != nil {
+				return fmt.Errorf("parsing --utls: %v", err)
+			}
+			if utlsClientHelloID != nil {
+				log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
+			}
+
+			remoteAddr := turbotunnel.DummyAddr{}
 			var rt http.RoundTripper
 			if utlsClientHelloID == nil {
 				transport := http.DefaultTransport.(*http.Transport).Clone()
-				// Disable DefaultTransport's default Proxy =
-				// ProxyFromEnvironment setting, for conformity
-				// with utlsRoundTripper and with DoT mode,
-				// which do not take a proxy from the
-				// environment.
 				transport.Proxy = nil
 				rt = transport
 			} else {
 				rt = NewUTLSRoundTripper(nil, utlsClientHelloID)
 			}
-			pconn, err := NewHTTPPacketConn(rt, dohURL, 32)
-			return addr, pconn, err
-		}},
-		// -dot
-		{dotAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			addr := turbotunnel.DummyAddr{}
+			httpConn, err := NewHTTPPacketConn(rt, dohURL, 32)
+			if err != nil {
+				return err
+			}
+
+			pconn := NewDNSPacketConn(httpConn, remoteAddr, domain)
+			return run(pubkey, domain, localAddr, remoteAddr, pconn)
+		},
+	}
+	dohCmd.Flags().StringVar(&utlsDoh, "utls", defaultUTLS,
+		"TLS fingerprint distribution (e.g. \"Firefox\", \"3*Firefox,2*Chrome\", \"none\")")
+	addPubkeyFlags(dohCmd)
+
+	// ── dot subcommand ────────────────────────────────────────────────────
+	var utlsDot string
+	dotCmd := &cobra.Command{
+		Use:   "dot DOMAIN LOCALADDR RESOLVER_ADDR",
+		Short: "Use DNS-over-TLS (DoT) as transport",
+		Long: `Connect to the tunnel server using DNS-over-TLS (DoT).
+
+DOMAIN        – root DNS zone delegated to the tunnel server (e.g. t.example.com)
+LOCALADDR     – local TCP address to listen on (e.g. 127.0.0.1:7000)
+RESOLVER_ADDR – host:port of the DoT resolver (e.g. dns.example:853)
+
+TLS fingerprint camouflage is enabled by default via uTLS.
+Use --utls to select a specific fingerprint or distribution.
+
+Known fingerprints for --utls:
+` + utlsFingerprints(),
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			domain, localAddr, err := parseCommonArgs(args[:2])
+			if err != nil {
+				return err
+			}
+			dotAddr := args[2]
+
+			pubkey, err := parsePubkey(pubkeyFile, pubkeyHex)
+			if err != nil {
+				return err
+			}
+
+			utlsClientHelloID, err := sampleUTLSDistribution(utlsDot)
+			if err != nil {
+				return fmt.Errorf("parsing --utls: %v", err)
+			}
+			if utlsClientHelloID != nil {
+				log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
+			}
+
+			remoteAddr := turbotunnel.DummyAddr{}
 			var dialTLSContext func(ctx context.Context, network, addr string) (net.Conn, error)
 			if utlsClientHelloID == nil {
 				dialTLSContext = (&tls.Dialer{}).DialContext
@@ -375,41 +393,61 @@ Known TLS fingerprints for -utls are:
 					return utlsDialContext(ctx, network, addr, nil, utlsClientHelloID)
 				}
 			}
-			pconn, err := NewTLSPacketConn(dotAddr, dialTLSContext)
-			return addr, pconn, err
-		}},
-		// -udp
-		{udpAddr, func(s string) (net.Addr, net.PacketConn, error) {
-			addr, err := net.ResolveUDPAddr("udp", s)
+			tlsConn, err := NewTLSPacketConn(dotAddr, dialTLSContext)
 			if err != nil {
-				return nil, nil, err
+				return err
+			}
+
+			pconn := NewDNSPacketConn(tlsConn, remoteAddr, domain)
+			return run(pubkey, domain, localAddr, remoteAddr, pconn)
+		},
+	}
+	dotCmd.Flags().StringVar(&utlsDot, "utls", defaultUTLS,
+		"TLS fingerprint distribution (e.g. \"Firefox\", \"3*Firefox,2*Chrome\", \"none\")")
+	addPubkeyFlags(dotCmd)
+
+	// ── udp subcommand ────────────────────────────────────────────────────
+	udpCmd := &cobra.Command{
+		Use:   "udp DOMAIN LOCALADDR RESOLVER_ADDR",
+		Short: "Use plain UDP DNS as transport",
+		Long: `Connect to the tunnel server using plain UDP DNS.
+
+DOMAIN        – root DNS zone delegated to the tunnel server (e.g. t.example.com)
+LOCALADDR     – local TCP address to listen on (e.g. 127.0.0.1:7000)
+RESOLVER_ADDR – host:port of the UDP DNS resolver (e.g. dns.example:53)
+
+Note: UDP mode does not camouflage traffic and is recommended for testing only.`,
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			domain, localAddr, err := parseCommonArgs(args[:2])
+			if err != nil {
+				return err
+			}
+			udpAddr := args[2]
+
+			pubkey, err := parsePubkey(pubkeyFile, pubkeyHex)
+			if err != nil {
+				return err
+			}
+
+			remoteAddr, err := net.ResolveUDPAddr("udp", udpAddr)
+			if err != nil {
+				return fmt.Errorf("invalid resolver address %+q: %v", udpAddr, err)
 			}
 			pconn, err := net.ListenUDP("udp", nil)
-			return addr, pconn, err
-		}},
-	} {
-		if opt.s == "" {
-			continue
-		}
-		if pconn != nil {
-			fmt.Fprintf(os.Stderr, "only one of -doh, -dot, and -udp may be given\n")
-			os.Exit(1)
-		}
-		var err error
-		remoteAddr, pconn, err = opt.f(opt.s)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}
-	if pconn == nil {
-		fmt.Fprintf(os.Stderr, "one of -doh, -dot, or -udp is required\n")
-		os.Exit(1)
-	}
+			if err != nil {
+				return err
+			}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
-	err = run(pubkey, domain, localAddr, remoteAddr, pconn)
-	if err != nil {
-		log.Fatal(err)
+			pconn2 := NewDNSPacketConn(pconn, remoteAddr, domain)
+			return run(pubkey, domain, localAddr, remoteAddr, pconn2)
+		},
+	}
+	addPubkeyFlags(udpCmd)
+
+	rootCmd.AddCommand(dohCmd, dotCmd, udpCmd)
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
 	}
 }

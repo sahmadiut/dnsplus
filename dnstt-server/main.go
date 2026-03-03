@@ -2,37 +2,13 @@
 //
 // Usage:
 //
-//	dnstt-server -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
-//	dnstt-server -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] UPSTREAMADDR
+//	dnstt-server gen-key [--privkey-file FILE] [--pubkey-file FILE]
+//	dnstt-server run --udp ADDR [--privkey-file FILE | --privkey HEX] [--mtu N] UPSTREAMADDR
 //
-// Example:
+// Examples:
 //
-//	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
-//	dnstt-server -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
-//
-// To generate a persistent server private key, first run with the -gen-key
-// option. By default the generated private and public keys are printed to
-// standard output. To save them to files instead, use the -privkey-file and
-// -pubkey-file options.
-//
-//	dnstt-server -gen-key
-//	dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
-//
-// You can give the server's private key as a file or as a hex string.
-//
-//	-privkey-file server.key
-//	-privkey 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-//
-// The -udp option controls the address that will listen for incoming DNS
-// queries.
-//
-// The -mtu option controls the maximum size of response UDP payloads.
-// Queries that do not advertise requester support for responses of at least
-// this size at least this size will be responded to with a FORMERR. The default
-// value is maxUDPPayload.
-//
-// UPSTREAMADDR is the TCP address to which incoming tunnelled streams will be
-// forwarded.
+//	dnstt-server gen-key --privkey-file server.key --pubkey-file server.pub
+//	dnstt-server run --udp :53 --privkey-file server.key 127.0.0.1:8000
 package main
 
 import (
@@ -40,7 +16,6 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -50,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -842,128 +818,113 @@ func run(privkey []byte, upstream string, dnsConn net.PacketConn) error {
 }
 
 func main() {
-	var genKey bool
-	var privkeyFilename string
-	var privkeyString string
-	var pubkeyFilename string
-	var udpAddr string
-
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  %[1]s -udp ADDR -privkey-file PRIVKEYFILE UPSTREAMADDR
-
-Example:
-  %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
-  %[1]s -udp :53 -privkey-file server.key 127.0.0.1:8000
-
-`, os.Args[0])
-		flag.PrintDefaults()
-	}
-	flag.BoolVar(&genKey, "gen-key", false, "generate a server keypair; print to stdout or save to files")
-	flag.IntVar(&maxUDPPayload, "mtu", maxUDPPayload, "maximum size of DNS responses")
-	flag.StringVar(&privkeyString, "privkey", "", fmt.Sprintf("server private key (%d hex digits)", noise.KeyLen*2))
-	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
-	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
-	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
-	flag.Parse()
-
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
-	if genKey {
-		// -gen-key mode.
-		if flag.NArg() != 0 || privkeyString != "" || udpAddr != "" {
-			flag.Usage()
-			os.Exit(1)
-		}
-		if err := generateKeypair(privkeyFilename, pubkeyFilename); err != nil {
-			fmt.Fprintf(os.Stderr, "cannot generate keypair: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		// Ordinary server mode.
-		if flag.NArg() != 1 {
-			flag.Usage()
-			os.Exit(1)
-		}
-		upstream := flag.Arg(0)
-		// We keep upstream as a string in order to eventually pass it
-		// to net.Dial in handleStream. But for the sake of displaying
-		// an error or warning at startup, rather than only when the
-		// first stream occurs, we apply some parsing and name
-		// resolution checks here.
-		{
+	rootCmd := &cobra.Command{
+		Use:   "dnstt-server",
+		Short: "DNS tunnel server",
+		Long: `dnstt-server is the server side of a DNS tunnel.
+
+Use "gen-key" to generate a server keypair, then "run" to start the server.`,
+	}
+
+	// ── gen-key subcommand ────────────────────────────────────────────────
+	var genPrivkeyFile string
+	var genPubkeyFile string
+	genKeyCmd := &cobra.Command{
+		Use:   "gen-key",
+		Short: "Generate a server keypair",
+		Long: `Generate a Noise protocol keypair for the server.
+
+By default, the private and public keys are printed to standard output.
+Use --privkey-file and --pubkey-file to save them to files instead.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return generateKeypair(genPrivkeyFile, genPubkeyFile)
+		},
+	}
+	genKeyCmd.Flags().StringVar(&genPrivkeyFile, "privkey-file", "", "write private key to file")
+	genKeyCmd.Flags().StringVar(&genPubkeyFile, "pubkey-file", "", "write public key to file")
+
+	// ── run subcommand ────────────────────────────────────────────────────
+	var runUDPAddr string
+	var runPrivkeyFile string
+	var runPrivkeyHex string
+	var runMTU int
+	runCmd := &cobra.Command{
+		Use:   "run UPSTREAMADDR",
+		Short: "Start the tunnel server",
+		Long: `Start the DNS tunnel server.
+
+UPSTREAMADDR – TCP address to forward incoming tunnel streams to (e.g. 127.0.0.1:8000)
+
+The server listens for UDP DNS queries on the address given by --udp and
+forwards decrypted tunnel streams to UPSTREAMADDR.
+
+If neither --privkey nor --privkey-file is provided, a temporary one-time
+keypair is generated. Use "gen-key" to create a persistent keypair.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			upstream := args[0]
+
+			// Validate upstream address.
 			upstreamHost, _, err := net.SplitHostPort(upstream)
 			if err != nil {
-				// host:port format is required in all cases, so
-				// this is a fatal error.
-				fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: %v\n", upstream, err)
-				os.Exit(1)
+				return fmt.Errorf("cannot parse upstream address %+q: %v", upstream, err)
 			}
 			upstreamIPAddr, err := net.ResolveIPAddr("ip", upstreamHost)
 			if err != nil {
-				// Failure to resolve the host portion is only a
-				// warning. The name will be re-resolved on each
-				// net.Dial in handleStream.
 				log.Printf("warning: cannot resolve upstream host %+q: %v", upstreamHost, err)
 			} else if upstreamIPAddr.IP == nil {
-				// Handle the special case of an empty string
-				// for the host portion, which resolves to a nil
-				// IP. This is a fatal error as we will not be
-				// able to dial this address.
-				fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: missing host in address\n", upstream)
-				os.Exit(1)
+				return fmt.Errorf("cannot parse upstream address %+q: missing host in address", upstream)
 			}
-		}
 
-		if udpAddr == "" {
-			fmt.Fprintf(os.Stderr, "the -udp option is required\n")
-			os.Exit(1)
-		}
-		dnsConn, err := net.ListenPacket("udp", udpAddr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "opening UDP listener: %v\n", err)
-			os.Exit(1)
-		}
+			if runUDPAddr == "" {
+				return fmt.Errorf("--udp is required")
+			}
 
-		if pubkeyFilename != "" {
-			fmt.Fprintf(os.Stderr, "-pubkey-file may only be used with -gen-key\n")
-			os.Exit(1)
-		}
-
-		var privkey []byte
-		if privkeyFilename != "" && privkeyString != "" {
-			fmt.Fprintf(os.Stderr, "only one of -privkey and -privkey-file may be used\n")
-			os.Exit(1)
-		} else if privkeyFilename != "" {
-			var err error
-			privkey, err = readKeyFromFile(privkeyFilename)
+			dnsConn, err := net.ListenPacket("udp", runUDPAddr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "cannot read privkey from file: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("opening UDP listener: %v", err)
 			}
-		} else if privkeyString != "" {
-			var err error
-			privkey, err = noise.DecodeKey(privkeyString)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "privkey format error: %v\n", err)
-				os.Exit(1)
-			}
-		}
-		if len(privkey) == 0 {
-			log.Println("generating a temporary one-time keypair")
-			log.Println("use the -privkey or -privkey-file option for a persistent server keypair")
-			var err error
-			privkey, err = noise.GeneratePrivkey()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-		}
 
-		err = run(privkey, upstream, dnsConn)
-		if err != nil {
-			log.Fatal(err)
-		}
+			// Set maxUDPPayload from flag.
+			maxUDPPayload = runMTU
+
+			var privkey []byte
+			if runPrivkeyFile != "" && runPrivkeyHex != "" {
+				return fmt.Errorf("only one of --privkey and --privkey-file may be used")
+			} else if runPrivkeyFile != "" {
+				privkey, err = readKeyFromFile(runPrivkeyFile)
+				if err != nil {
+					return fmt.Errorf("cannot read privkey from file: %v", err)
+				}
+			} else if runPrivkeyHex != "" {
+				privkey, err = noise.DecodeKey(runPrivkeyHex)
+				if err != nil {
+					return fmt.Errorf("privkey format error: %v", err)
+				}
+			}
+			if len(privkey) == 0 {
+				log.Println("generating a temporary one-time keypair")
+				log.Println("use --privkey or --privkey-file for a persistent server keypair")
+				privkey, err = noise.GeneratePrivkey()
+				if err != nil {
+					return err
+				}
+			}
+
+			return run(privkey, upstream, dnsConn)
+		},
+	}
+	runCmd.Flags().StringVar(&runUDPAddr, "udp", "", "UDP address to listen on for DNS queries (required, e.g. :53)")
+	runCmd.Flags().StringVar(&runPrivkeyFile, "privkey-file", "", "path to server private key file")
+	runCmd.Flags().StringVar(&runPrivkeyHex, "privkey", "", fmt.Sprintf("server private key as hex (%d digits)", noise.KeyLen*2))
+	runCmd.Flags().IntVar(&runMTU, "mtu", maxUDPPayload, "maximum size of DNS response UDP payloads")
+
+	rootCmd.AddCommand(genKeyCmd, runCmd)
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
 	}
 }
