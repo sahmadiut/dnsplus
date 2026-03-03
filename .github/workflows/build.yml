@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    name: Build Linux binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build dnstt-server (Linux)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -v -o dnstt-server-linux-amd64 ./dnstt-server/
+
+      - name: Build dnstt-client (Linux)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -v -o dnstt-client-linux-amd64 ./dnstt-client/
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnstt-server-linux-amd64
+          path: dnstt-server-linux-amd64
+          if-no-files-found: error
+
+      - name: Upload client binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnstt-client-linux-amd64
+          path: dnstt-client-linux-amd64
+          if-no-files-found: error
